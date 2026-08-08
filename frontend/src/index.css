@@ -1,0 +1,86 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background-color: #09090b; /* zinc-950 */
+  color: #e4e4e7; /* zinc-200 */
+}
+
+/* Slim dark scrollbars, high-density professional look */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* React Flow dark theme overrides */
+.react-flow {
+  background: #09090b;
+}
+.react-flow__controls {
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.react-flow__controls-button {
+  background: #18181b;
+  border-bottom: 1px solid #27272a;
+  fill: #a1a1aa;
+}
+.react-flow__controls-button:hover {
+  background: #27272a;
+}
+.react-flow__minimap {
+  background: #18181b !important;
+  border: 1px solid #27272a;
+  border-radius: 6px;
+}
+.react-flow__attribution {
+  background: transparent;
+  color: #52525b;
+}
+.react-flow__edge-path {
+  stroke: #52525b;
+}
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #38bdf8;
+}
+.react-flow__connection-path {
+  stroke: #38bdf8;
+  stroke-width: 2;
+}
+.react-flow__handle {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #09090b;
+}
+.react-flow__handle:hover {
+  transform: scale(1.25);
+}
+.react-flow__handle.connectingto {
+  box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.35);
+}
+.react-flow__nodesselection-rect,
+.react-flow__selection {
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.4);
+}

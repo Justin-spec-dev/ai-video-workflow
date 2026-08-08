@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2
+aiosqlite
+pydantic>=2
+pydantic-settings
+httpx
+cryptography
+python-multipart
+pytest
+pytest-asyncio
+pytest-mock
