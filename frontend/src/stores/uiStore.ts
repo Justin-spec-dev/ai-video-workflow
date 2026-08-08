@@ -38,7 +38,7 @@ interface UIStoreState {
   quickStartOpen: boolean;
   setQuickStartOpen: (open: boolean) => void;
 
-  /** 左侧节点库整栏收起/展开（持久化到 localStorage）。 */
+  /** 左侧侧栏（工作流 + 节点库）整栏收起/展开（持久化到 localStorage）。 */
   libraryCollapsed: boolean;
   toggleLibrary: () => void;
 }

@@ -5,9 +5,9 @@ import { BottomPanel } from './components/BottomPanel';
 import { CredentialsDialog } from './components/CredentialsDialog';
 import { EstimateDialog } from './components/EstimateDialog';
 import { InspectDialog } from './components/InspectDialog';
-import { NodeLibrary } from './components/NodeLibrary';
 import { PropertiesPanel } from './components/PropertiesPanel';
 import { QuickStartDialog } from './components/QuickStartDialog';
+import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
 import { Toaster } from './components/ui/toast';
 import { useWebsocket } from './hooks/useWebsocket';
@@ -82,7 +82,7 @@ export default function App() {
       <TopBar />
       {ready ? (
         <div className="flex min-h-0 flex-1">
-          <NodeLibrary />
+          <Sidebar />
           <div className="flex min-w-0 flex-1 flex-col">
             <ReactFlowProvider>
               <Canvas />
