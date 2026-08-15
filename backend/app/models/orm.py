@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..core.database import Base
@@ -45,6 +45,10 @@ class WorkflowRun(Base):
 
 class NodeRun(Base):
     __tablename__ = "node_runs"
+    __table_args__ = (
+        # 热路径查询：run_from_here 回填/历史回填按 (workflow_id, node_id) 取最近成功输出
+        Index("ix_noderun_wf_node_started", "workflow_id", "node_id", "started_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_short_uuid)
     run_id: Mapped[str] = mapped_column(String(32), ForeignKey("workflow_runs.id"), index=True)

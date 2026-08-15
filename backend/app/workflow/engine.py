@@ -9,9 +9,10 @@ import time
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from ..core.config import MAX_CONCURRENCY, OUTPUTS_DIR
+from ..core.config import MAX_CONCURRENCY, OUTPUT_RETENTION, OUTPUTS_DIR
 from ..core.database import SessionLocal
 from ..core.events import bus
 from ..core.security import redact
@@ -19,6 +20,7 @@ from ..credentials.service import CredentialService
 from ..models.orm import CacheEntry, NodeRun, Task, Workflow, WorkflowRun, utcnow_iso
 from ..nodes.base import NODE_REGISTRY
 from ..services import ffmpeg as ffmpeg_service
+from ..services.cleanup import cleanup_old_outputs
 from ..services.settings import get_settings
 from . import dag
 from .cache import compute_cache_key
@@ -166,10 +168,21 @@ class WorkflowEngine:
         nodes = data.get("nodes", [])
         edges = data.get("edges", [])
         node_by_id = {n["id"]: n for n in nodes}
-        layers = dag.topo_layers(nodes, edges)
+        layers, rev, _adj = dag.analyze(nodes, edges)
+        # 预建入边索引：_resolve_inputs 每节点 O(入边数) 而非每次全表扫描 edges
+        edges_by_target: dict[str, list[dict]] = {}
+        for e in edges:
+            edges_by_target.setdefault(e["target"], []).append(e)
 
         out_dir = OUTPUTS_DIR / slugify(wf_name) / f"run_{int(time.time())}_{run_id[:6]}"
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- 旧 run 输出保留策略（顺带清理引用它们的缓存/历史行，避免缓存指向已删文件）----
+        try:
+            await cleanup_old_outputs(self.session_factory, OUTPUTS_DIR / slugify(wf_name),
+                                      keep=OUTPUT_RETENTION)
+        except Exception:  # 清理失败不应影响本次运行
+            logger.exception("run 输出清理失败（忽略）")
 
         services = ServiceRegistry(
             ffmpeg=ffmpeg_service,
@@ -223,7 +236,6 @@ class WorkflowEngine:
 
         # ---- topo-layer parallel execution ----
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-        rev = dag.reverse_graph(nodes, edges)
         any_failed = False
 
         # ---- variables pre-pass ----
@@ -232,7 +244,7 @@ class WorkflowEngine:
         for n in nodes:
             cls = NODE_REGISTRY.get(n["type"])
             if getattr(cls, "provides_variables", False) and n["id"] not in context.node_statuses:
-                status = await self._run_node(context, n, edges, rev, semaphore)
+                status = await self._run_node(context, n, edges_by_target, rev, semaphore)
                 if status == "FAILED":
                     any_failed = True
 
@@ -246,7 +258,7 @@ class WorkflowEngine:
                 continue
             to_run = [nid for nid in layer if nid not in context.node_statuses]
             results = await asyncio.gather(*(
-                self._run_node(context, node_by_id[nid], edges, rev, semaphore)
+                self._run_node(context, node_by_id[nid], edges_by_target, rev, semaphore)
                 for nid in to_run
             ))
             for status in results:
@@ -283,13 +295,13 @@ class WorkflowEngine:
 
     # ------------------------------------------------------------------ single node
 
-    def _resolve_inputs(self, node: dict, edges: list[dict],
+    def _resolve_inputs(self, node: dict, edges_by_target: dict[str, list[dict]],
                         context: ExecutionContext) -> dict:
         cls = NODE_REGISTRY.get(node["type"])
         inputs: dict = {}
         for port in cls.inputs:
-            incoming = [e for e in edges
-                        if e["target"] == node["id"] and e.get("target_handle") == port.key]
+            incoming = [e for e in edges_by_target.get(node["id"], [])
+                        if e.get("target_handle") == port.key]
             if port.multiple:
                 values = [context.node_results[e["source"]].get(e["source_handle"])
                           for e in incoming if e["source"] in context.node_results]
@@ -302,7 +314,8 @@ class WorkflowEngine:
                         break
         return inputs
 
-    async def _run_node(self, context: ExecutionContext, node: dict, edges: list[dict],
+    async def _run_node(self, context: ExecutionContext, node: dict,
+                        edges_by_target: dict[str, list[dict]],
                         rev: dict[str, list[str]], semaphore: asyncio.Semaphore) -> str:
         run_id, nid, ntype = context.run_id, node["id"], node["type"]
         wf_id = context.workflow_id
@@ -329,7 +342,7 @@ class WorkflowEngine:
 
             cls = NODE_REGISTRY.get(ntype)
             config = node.get("config") or {}
-            inputs = self._resolve_inputs(node, edges, context)
+            inputs = self._resolve_inputs(node, edges_by_target, context)
             cache_key = compute_cache_key(ntype, cls.version, config, inputs)
 
             # cache lookup（run_from_here 的目标节点强制重跑，绕过缓存）
@@ -354,13 +367,22 @@ class WorkflowEngine:
                 outputs = await instance.execute(inputs, config, context)
                 context.node_statuses[nid] = "SUCCESS"
                 context.node_results[nid] = outputs
-                remote_task_id = await self._node_remote_task_id(run_id, nid)
-                await self._cache_store(wf_id, nid, cache_key, outputs)
-                await self._record_node_run(session_factory=self.session_factory, run_id=run_id,
-                                            workflow_id=wf_id, node_id=nid, node_type=ntype,
-                                            status="SUCCESS", inputs=inputs, outputs=outputs,
-                                            cache_key=cache_key, config=config, task_id=remote_task_id,
-                                            started_at=started, finished_at=utcnow_iso())
+                # 单 session 合并：远端 task 查询 + 缓存写入(冲突忽略) + NodeRun 落库，
+                # 此前每个动作各开一次 session/commit（20 节点 ≈ 80 次 DB round-trip）。
+                async with self.session_factory() as session:
+                    remote_task_id = await self._read_remote_task_id(session, run_id, nid)
+                    await session.execute(
+                        sqlite_insert(CacheEntry).values(
+                            workflow_id=wf_id, node_id=nid, cache_key=cache_key,
+                            outputs=json.dumps(outputs, ensure_ascii=False, default=str),
+                        ).on_conflict_do_nothing(
+                            index_elements=["workflow_id", "node_id", "cache_key"]))
+                    session.add(self._build_node_run(
+                        run_id=run_id, workflow_id=wf_id, node_id=nid, node_type=ntype,
+                        status="SUCCESS", inputs=inputs, outputs=outputs,
+                        cache_key=cache_key, config=config, task_id=remote_task_id,
+                        started_at=started, finished_at=utcnow_iso()))
+                    await session.commit()
                 bus.publish("node.success", {"run_id": run_id, "node_id": nid,
                                              "node_type": ntype, "outputs": outputs})
                 return "SUCCESS"
@@ -377,13 +399,15 @@ class WorkflowEngine:
             except Exception as e:  # noqa: BLE001 — node failures must not kill the engine
                 err = redact(str(e) or repr(e))
                 context.node_statuses[nid] = "FAILED"
-                remote_task_id = await self._node_remote_task_id(run_id, nid)
-                await self._record_node_run(session_factory=self.session_factory, run_id=run_id,
-                                            workflow_id=wf_id, node_id=nid, node_type=ntype,
-                                            status="FAILED", inputs=inputs,
-                                            cache_key=cache_key, config=config, task_id=remote_task_id,
-                                            started_at=started, finished_at=utcnow_iso(),
-                                            error=err)
+                async with self.session_factory() as session:
+                    remote_task_id = await self._read_remote_task_id(session, run_id, nid)
+                    session.add(self._build_node_run(
+                        run_id=run_id, workflow_id=wf_id, node_id=nid, node_type=ntype,
+                        status="FAILED", inputs=inputs,
+                        cache_key=cache_key, config=config, task_id=remote_task_id,
+                        started_at=started, finished_at=utcnow_iso(),
+                        error=err))
+                    await session.commit()
                 bus.publish("node.failed", {"run_id": run_id, "node_id": nid,
                                             "node_type": ntype, "error": err})
                 await context.log(f"节点执行失败: {err}", level="error", node_id=nid)
@@ -399,16 +423,6 @@ class WorkflowEngine:
             entry = (await session.execute(q)).scalars().first()
             return json.loads(entry.outputs) if entry else None
 
-    async def _cache_store(self, workflow_id: str, node_id: str, cache_key: str, outputs: dict) -> None:
-        async with self.session_factory() as session:
-            session.add(CacheEntry(workflow_id=workflow_id, node_id=node_id,
-                                   cache_key=cache_key,
-                                   outputs=json.dumps(outputs, ensure_ascii=False, default=str)))
-            try:
-                await session.commit()
-            except Exception:  # unique race between parallel runs — harmless
-                await session.rollback()
-
     async def clear_cache(self, workflow_id: str, node_id: str) -> int:
         from sqlalchemy import delete
         async with self.session_factory() as session:
@@ -418,33 +432,33 @@ class WorkflowEngine:
             await session.commit()
             return result.rowcount or 0
 
-    async def _node_remote_task_id(self, run_id: str, node_id: str) -> str | None:
-        """节点关联的最新一条 provider task 的 remote_task_id（用于 node_runs 回溯）。"""
-        async with self.session_factory() as session:
-            q = (select(Task).where(Task.run_id == run_id, Task.node_id == node_id)
-                 .order_by(Task.created_at.desc()))
-            t = (await session.execute(q)).scalars().first()
-            return t.remote_task_id if t else None
+    async def _read_remote_task_id(self, session, run_id: str, node_id: str) -> str | None:
+        """节点关联的最新一条 provider task 的 remote_task_id（复用传入 session，不单独开事务）。"""
+        q = (select(Task).where(Task.run_id == run_id, Task.node_id == node_id)
+             .order_by(Task.created_at.desc()))
+        t = (await session.execute(q)).scalars().first()
+        return t.remote_task_id if t else None
 
-    async def _record_node_run(self, *, session_factory, run_id, workflow_id, node_id,
-                               node_type, status, inputs=None, outputs=None, cache_key=None,
-                               config=None, error=None, started_at=None, finished_at=None,
-                               task_id=None) -> None:
+    def _build_node_run(self, *, run_id, workflow_id, node_id, node_type, status,
+                        inputs=None, outputs=None, cache_key=None, config=None, error=None,
+                        started_at=None, finished_at=None, task_id=None) -> NodeRun:
         config = config or {}
+        return NodeRun(
+            run_id=run_id, workflow_id=workflow_id, node_id=node_id, node_type=node_type,
+            status=status,
+            inputs=json.dumps(inputs, ensure_ascii=False, default=str) if inputs is not None else None,
+            outputs=json.dumps(outputs, ensure_ascii=False, default=str) if outputs is not None else None,
+            cache_key=cache_key,
+            provider=config.get("provider"),
+            model=config.get("model"),
+            credential_id=config.get("credential_id"),
+            task_id=task_id,
+            error=error, started_at=started_at, finished_at=finished_at,
+        )
+
+    async def _record_node_run(self, *, session_factory, **kwargs) -> None:
         async with session_factory() as session:
-            nr = NodeRun(
-                run_id=run_id, workflow_id=workflow_id, node_id=node_id, node_type=node_type,
-                status=status,
-                inputs=json.dumps(inputs, ensure_ascii=False, default=str) if inputs is not None else None,
-                outputs=json.dumps(outputs, ensure_ascii=False, default=str) if outputs is not None else None,
-                cache_key=cache_key,
-                provider=config.get("provider"),
-                model=config.get("model"),
-                credential_id=config.get("credential_id"),
-                task_id=task_id,
-                error=error, started_at=started_at, finished_at=finished_at,
-            )
-            session.add(nr)
+            session.add(self._build_node_run(**kwargs))
             await session.commit()
 
 

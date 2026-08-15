@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
 import mimetypes
 from pathlib import Path
@@ -18,6 +19,29 @@ MAX_BODY_BYTES = 64 * 1024 * 1024    # 64MB request body
 
 RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
 RESOLUTIONS = ["768P", "2K"]
+
+# 共享 AsyncClient：轮询/多节点并发场景复用连接，避免每个请求重新 DNS/TLS 握手。
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _default_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0))
+    return _shared_client
+
+
+def _close_shared_client() -> None:
+    global _shared_client
+    if _shared_client is not None:
+        try:
+            asyncio.run(_shared_client.aclose())
+        except Exception:
+            pass
+        _shared_client = None
+
+
+atexit.register(_close_shared_client)
 
 
 class MiniMaxVideoProvider(VideoProvider):
@@ -39,10 +63,11 @@ class MiniMaxVideoProvider(VideoProvider):
         return (credential.base_url or DEFAULT_BASE_URL).rstrip("/")
 
     def _client(self) -> httpx.AsyncClient:
-        kwargs = {"timeout": httpx.Timeout(60.0, read=300.0)}
+        # 测试注入 MockTransport 时每次新建独立 client；生产路径复用共享 client（不关闭）。
         if self._transport is not None:
-            kwargs["transport"] = self._transport
-        return httpx.AsyncClient(**kwargs)
+            return httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0),
+                                     transport=self._transport)
+        return _default_client()
 
     def _headers(self, credential: CredentialInfo) -> dict:
         return {
@@ -51,7 +76,8 @@ class MiniMaxVideoProvider(VideoProvider):
         }
 
     @staticmethod
-    def _image_to_data_uri(path: str) -> str:
+    def _encode_image_data_uri(path: str) -> str:
+        """Synchronous encoding work — run via asyncio.to_thread to avoid blocking the loop."""
         p = Path(path)
         if not p.is_file():
             raise ProviderError(f"图片文件不存在: {path}")
@@ -62,27 +88,31 @@ class MiniMaxVideoProvider(VideoProvider):
         b64 = base64.b64encode(p.read_bytes()).decode()
         return f"data:{mime};base64,{b64}"
 
-    def _build_content(self, request: VideoTaskRequest) -> list[dict]:
+    async def _image_to_data_uri(self, path: str) -> str:
+        # 30MB 图片同步读+base64 会阻塞事件循环秒级，放入线程池执行
+        return await asyncio.to_thread(self._encode_image_data_uri, path)
+
+    async def _build_content(self, request: VideoTaskRequest) -> list[dict]:
         content: list[dict] = [{"type": "text", "text": request.prompt}]
         if request.last_frame_path and not request.first_frame_path:
             raise ProviderError("MiniMax 要求 last_frame 必须与 first_frame 同时提供（不支持单独尾帧）")
         if request.first_frame_path:
             content.append({
                 "type": "image_url",
-                "image_url": {"url": self._image_to_data_uri(request.first_frame_path)},
+                "image_url": {"url": await self._image_to_data_uri(request.first_frame_path)},
                 "role": "first_frame",
             })
         if request.last_frame_path:
             content.append({
                 "type": "image_url",
-                "image_url": {"url": self._image_to_data_uri(request.last_frame_path)},
+                "image_url": {"url": await self._image_to_data_uri(request.last_frame_path)},
                 "role": "last_frame",
             })
         return content
 
-    def _build_body(self, request: VideoTaskRequest) -> dict:
+    async def _build_body(self, request: VideoTaskRequest) -> dict:
         has_frames = bool(request.first_frame_path)
-        content = self._build_content(request)
+        content = await self._build_content(request)
         if has_frames:
             ratio = "adaptive"  # 有首/尾帧时 ratio 固定 adaptive
         else:
@@ -113,28 +143,33 @@ class MiniMaxVideoProvider(VideoProvider):
     async def _request(self, method: str, url: str, credential: CredentialInfo,
                        json_body: dict | None = None, retries: int = 0) -> httpx.Response:
         last_exc: Exception | None = None
-        for attempt in range(retries + 1):
-            try:
-                async with self._client() as client:
+        client = self._client()
+        try:
+            for attempt in range(retries + 1):
+                try:
                     resp = await client.request(method, url, headers=self._headers(credential), json=json_body)
-                if resp.status_code == 429 or resp.status_code >= 500:
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        if attempt < retries:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        raise self._parse_error(resp)
+                    if resp.status_code >= 400:
+                        raise self._parse_error(resp)
+                    return resp
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    last_exc = e
                     if attempt < retries:
                         await asyncio.sleep(2 ** attempt)
                         continue
-                    raise self._parse_error(resp)
-                if resp.status_code >= 400:
-                    raise self._parse_error(resp)
-                return resp
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
-                last_exc = e
-                if attempt < retries:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                raise ProviderError(f"网络错误: {redact(str(e))}", retryable=True) from e
-        raise ProviderError(f"请求失败: {last_exc}")
+                    raise ProviderError(f"网络错误: {redact(str(e))}", retryable=True) from e
+            raise ProviderError(f"请求失败: {last_exc}")
+        finally:
+            # 仅关闭测试注入的独立 client；共享 client 由 atexit 统一关闭
+            if self._transport is not None:
+                await client.aclose()
 
     async def create_task(self, request: VideoTaskRequest, credential: CredentialInfo) -> str:
-        body = self._build_body(request)
+        body = await self._build_body(request)
         import json as _json
         if len(_json.dumps(body).encode()) > MAX_BODY_BYTES:
             raise ProviderError("请求体超过 64MB 限制，请减小输入图片")
@@ -168,13 +203,17 @@ class MiniMaxVideoProvider(VideoProvider):
 
     async def download(self, url: str, destination: str) -> None:
         Path(destination).parent.mkdir(parents=True, exist_ok=True)
-        async with self._client() as client:
+        client = self._client()
+        try:
             async with client.stream("GET", url) as resp:
                 if resp.status_code >= 400:
                     raise ProviderError(f"下载视频失败 (HTTP {resp.status_code})", http_code=resp.status_code)
                 with open(destination, "wb") as f:
                     async for chunk in resp.aiter_bytes(chunk_size=1 << 16):
                         f.write(chunk)
+        finally:
+            if self._transport is not None:
+                await client.aclose()
 
     async def cancel(self, task_id: str, credential: CredentialInfo) -> bool:
         try:
@@ -186,19 +225,23 @@ class MiniMaxVideoProvider(VideoProvider):
             return False
 
     async def test_connection(self, credential: CredentialInfo) -> tuple[bool, str]:
+        client = self._client()
         try:
-            async with self._client() as client:
+            try:
                 resp = await client.get(
                     f"{self._base(credential)}/v2/query/video_generation",
                     headers=self._headers(credential),
                     params={"page": 1, "page_size": 1},
                 )
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
-            return False, f"连接失败: {redact(str(e))}"
-        if resp.status_code == 401:
-            return False, "认证失败（401）：请检查 API Key"
-        if resp.status_code == 404:
-            return False, "无法验证（端点不可用，404）"
-        if resp.status_code >= 400:
-            return False, f"请求失败 (HTTP {resp.status_code})"
-        return True, "连接成功"
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                return False, f"连接失败: {redact(str(e))}"
+            if resp.status_code == 401:
+                return False, "认证失败（401）：请检查 API Key"
+            if resp.status_code == 404:
+                return False, "无法验证（端点不可用，404）"
+            if resp.status_code >= 400:
+                return False, f"请求失败 (HTTP {resp.status_code})"
+            return True, "连接成功"
+        finally:
+            if self._transport is not None:
+                await client.aclose()

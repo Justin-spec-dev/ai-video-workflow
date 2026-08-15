@@ -111,6 +111,7 @@ class VideoGenerationNode(BaseNode):
         timeout = float(config.get("timeout") or 1800)
         deadline = time.monotonic() + timeout
         status = None
+        last_status = None
         while True:
             if context.cancel_event.is_set():
                 cancelled = await provider.cancel(remote_id, credential)
@@ -128,15 +129,18 @@ class VideoGenerationNode(BaseNode):
                 raise NodeCancelledError()
 
             status = await provider.get_task_status(remote_id, credential, retries=retry_count)
-            bus.publish("task.processing", {
-                "task_id": local_task_id, "node_id": context.current_node_id,
-                "remote_status": status.model_dump(exclude={"raw"}),
-            })
-            async with session_factory() as session:
-                t = await session.get(Task, local_task_id)
-                t.status = status.status
-                t.remote_status = json.dumps(status.raw, ensure_ascii=False, default=str)
-                await session.commit()
+            if status.status != last_status:
+                # 只在状态变化时写库 + 广播，避免每轮询周期全量写 remote_status 并刷屏 WS
+                last_status = status.status
+                bus.publish("task.processing", {
+                    "task_id": local_task_id, "node_id": context.current_node_id,
+                    "remote_status": status.model_dump(exclude={"raw"}),
+                })
+                async with session_factory() as session:
+                    t = await session.get(Task, local_task_id)
+                    t.status = status.status
+                    t.remote_status = json.dumps(status.raw, ensure_ascii=False, default=str)
+                    await session.commit()
 
             if status.status == "succeeded":
                 break

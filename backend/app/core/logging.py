@@ -1,8 +1,9 @@
-"""Logging setup: stdout + backend/data/server.log."""
+"""Logging setup: stdout + backend/data/server.log (rotating, 10MB × 5 backups)."""
 from __future__ import annotations
 
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 
 from .config import SERVER_LOG_PATH, ensure_dirs
 
@@ -22,7 +23,8 @@ def setup_logging() -> None:
     stdout_handler.setFormatter(fmt)
     root.addHandler(stdout_handler)
 
-    file_handler = logging.FileHandler(SERVER_LOG_PATH, encoding="utf-8")
+    file_handler = RotatingFileHandler(SERVER_LOG_PATH, maxBytes=10 * 1024 * 1024,
+                                       backupCount=5, encoding="utf-8")
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 

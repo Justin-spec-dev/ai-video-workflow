@@ -51,10 +51,23 @@ def topological_sort(nodes: list[dict], edges: list[dict]) -> list[str]:
 
 def topo_layers(nodes: list[dict], edges: list[dict]) -> list[list[str]]:
     """Kahn by level: nodes in the same layer have no mutual dependencies."""
+    layers, _rev, _adj = analyze(nodes, edges)
+    return layers
+
+
+def analyze(nodes: list[dict], edges: list[dict]) -> tuple[list[list[str]], dict[str, list[str]], dict[str, list[str]]]:
+    """One-pass DAG analysis: returns (topo_layers, reverse_adjacency, adjacency).
+
+    Builds both adjacency maps and the layer order in a single traversal — the engine's
+    hot path previously rebuilt each structure separately on every run.
+    """
     node_ids = [n["id"] for n in nodes]
-    adj = build_graph(nodes, edges)
+    adj: dict[str, list[str]] = {nid: [] for nid in node_ids}
+    rev: dict[str, list[str]] = {nid: [] for nid in node_ids}
     in_degree = {nid: 0 for nid in node_ids}
     for e in edges:
+        adj.setdefault(e["source"], []).append(e["target"])
+        rev.setdefault(e["target"], []).append(e["source"])
         if e["target"] in in_degree:
             in_degree[e["target"]] += 1
     current = [nid for nid in node_ids if in_degree[nid] == 0]
@@ -72,7 +85,7 @@ def topo_layers(nodes: list[dict], edges: list[dict]) -> list[list[str]]:
         current = nxt
     if done != len(node_ids):
         raise WorkflowValidationError("工作流存在环（cycle），无法拓扑排序")
-    return layers
+    return layers, rev, adj
 
 
 def detect_cycle(nodes: list[dict], edges: list[dict]) -> bool:

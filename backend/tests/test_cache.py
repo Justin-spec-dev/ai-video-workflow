@@ -38,3 +38,43 @@ def test_ui_fields_stripped():
     h1 = compute_cache_key("prompt", "1.0.0", {"text": "a"}, {})
     h2 = compute_cache_key("prompt", "1.0.0", {"text": "a", "_selected": True}, {})
     assert h1 == h2
+
+
+def test_media_input_ignores_run_timestamped_path(tmp_path):
+    """回归：outputs 路径含 run_<ts> 时间戳，旧实现（key 嵌入绝对路径）导致
+    媒体下游节点缓存永远 miss。同一文件内容未变 → key 必须稳定。"""
+    import os
+    import shutil
+
+    a = tmp_path / "run_1" / "nodes" / "n1" / "video.mp4"
+    a.parent.mkdir(parents=True)
+    a.write_bytes(b"FAKE-MP4-CONTENT")
+    # 模拟 run_2 目录里"内容相同"的文件（copy2 保留 mtime，指纹一致）
+    b = tmp_path / "run_2" / "nodes" / "n1" / "video.mp4"
+    b.parent.mkdir(parents=True)
+    shutil.copy2(a, b)
+    assert a.stat().st_mtime_ns == b.stat().st_mtime_ns  # 指纹前提
+
+    media_a = {"path": str(a), "url": "/api/files/outputs/run_1/nodes/n1/video.mp4", "filename": "video.mp4"}
+    media_b = {"path": str(b), "url": "/api/files/outputs/run_2/nodes/n1/video.mp4", "filename": "video.mp4"}
+    h1 = compute_cache_key("last_frame", "1.0.0", {}, {"video": media_a})
+    h2 = compute_cache_key("last_frame", "1.0.0", {}, {"video": media_b})
+    assert h1 == h2
+
+
+def test_media_content_change_changes_hash(tmp_path):
+    """同一路径文件内容变化 → 指纹变化 → key 变化（缓存正确失效）。"""
+    f = tmp_path / "frame.png"
+    f.write_bytes(b"AAA")
+    h1 = compute_cache_key("video_generation", "1.0.0", {"model": "m"}, {"image": {"path": str(f)}})
+    f.write_bytes(b"BBB")
+    h2 = compute_cache_key("video_generation", "1.0.0", {"model": "m"}, {"image": {"path": str(f)}})
+    assert h1 != h2
+
+
+def test_missing_media_file_keeps_path_in_key(tmp_path):
+    """文件不存在时（异常输出/外部引用）退回原行为，且两次 key 一致（确定性）。"""
+    path = str(tmp_path / "nonexistent.png")
+    h1 = compute_cache_key("video_generation", "1.0.0", {}, {"image": {"path": path}})
+    h2 = compute_cache_key("video_generation", "1.0.0", {}, {"image": {"path": path}})
+    assert h1 == h2
